@@ -14,8 +14,10 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -56,6 +58,8 @@ var (
 	paused         bool
 	pausedMu       sync.RWMutex
 	speedRatio     float64
+	pitchRatio     float64
+	startLevel     int
 )
 
 // sensorReady is closed once shared memory is created and the sensor
@@ -85,6 +89,9 @@ const (
 
 	// defaultSpeedRatio is the default playback speed (1.0 = normal).
 	defaultSpeedRatio = 1.0
+
+	// defaultPitchRatio is the default pitch multiplier (1.0 = normal).
+	defaultPitchRatio = 1.0
 
 	// defaultSensorPollInterval is how often we check for new accelerometer data.
 	defaultSensorPollInterval = 10 * time.Millisecond
@@ -214,6 +221,7 @@ func (st *slapTracker) getFile(score float64) string {
 	// to the final file.
 	maxIdx := len(st.pack.files) - 1
 	idx := int(float64(len(st.pack.files)) * (1.0 - math.Exp(-(score-1)/st.scale)))
+	idx += startLevel
 	if idx > maxIdx {
 		idx = maxIdx
 	}
@@ -261,6 +269,8 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 	cmd.Flags().BoolVar(&stdioMode, "stdio", false, "Enable stdio mode: JSON output and stdin commands (for GUI integration)")
 	cmd.Flags().BoolVar(&volumeScaling, "volume-scaling", false, "Scale playback volume by slap amplitude (harder hits = louder)")
 	cmd.Flags().Float64Var(&speedRatio, "speed", defaultSpeedRatio, "Playback speed multiplier (0.5 = half speed, 2.0 = double speed)")
+	cmd.Flags().Float64Var(&pitchRatio, "pitch", defaultPitchRatio, "Pitch multiplier (0.5 = lower/deeper, 2.0 = higher). Also affects speed.")
+	cmd.Flags().IntVar(&startLevel, "start-level", 0, "Starting intensity level for sexy mode (0-59)")
 
 	if err := fang.Execute(context.Background(), cmd); err != nil {
 		os.Exit(1)
@@ -460,6 +470,135 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 
 var speakerMu sync.Mutex
 
+// ffmpegAvailable checks once whether ffmpeg is in PATH.
+var ffmpegAvailable = sync.OnceValue(func() bool {
+	_, err := exec.LookPath("ffmpeg")
+	return err == nil
+})
+
+// buildAtempoChain returns a chain of atempo filters to achieve the target
+// speed ratio. ffmpeg's atempo filter only accepts values in [0.5, 2.0], so
+// for values outside this range we chain multiple filters.
+func buildAtempoChain(ratio float64) string {
+	if ratio == 1.0 {
+		return ""
+	}
+	var filters []string
+	r := ratio
+	for r < 0.5 {
+		filters = append(filters, "atempo=0.5")
+		r /= 0.5
+	}
+	for r > 2.0 {
+		filters = append(filters, "atempo=2.0")
+		r /= 2.0
+	}
+	filters = append(filters, "atempo="+strconv.FormatFloat(r, 'f', 6, 64))
+	return strings.Join(filters, ",")
+}
+
+// processAudioFFmpeg pipes source through ffmpeg to apply independent
+// pitch and speed adjustments. Returns a new beep.Streamer with the
+// processed audio at the original sample rate.
+//
+// Pitch is shifted via asetrate (changes sample rate interpretation, shifting
+// pitch without affecting perceived duration). Speed is then adjusted via
+// atempo (time-stretches without affecting pitch). Together they are fully
+// independent.
+func processAudioFFmpeg(source beep.Streamer, sampleRate beep.SampleRate, speed, pitch float64) (beep.Streamer, error) {
+	if !ffmpegAvailable() {
+		return nil, fmt.Errorf("ffmpeg not found in PATH — install it with: brew install ffmpeg")
+	}
+
+	// Encode source back to raw PCM s16le for ffmpeg input.
+	// We use ffmpeg's pipe:0 / pipe:1 for stdin/stdout streaming.
+	rate := int(sampleRate)
+
+	// Build the filter chain:
+	//   asetrate: shifts pitch by reinterpreting the sample rate.
+	//             Compensate duration by following with aresample.
+	//   atempo:   adjusts playback speed without affecting pitch.
+	var filterParts []string
+
+	if pitch != 1.0 {
+		pitchedRate := int(float64(rate) * pitch)
+		filterParts = append(filterParts,
+			fmt.Sprintf("asetrate=%d", pitchedRate),
+			fmt.Sprintf("aresample=%d", rate),
+		)
+	}
+	if speed != 1.0 {
+		chain := buildAtempoChain(speed)
+		if chain != "" {
+			filterParts = append(filterParts, chain)
+		}
+	}
+
+	filterStr := strings.Join(filterParts, ",")
+
+	// Collect all PCM samples from the source streamer.
+	var pcmBuf bytes.Buffer
+	buf := make([][2]float64, 512)
+	for {
+		n, ok := source.Stream(buf)
+		for i := 0; i < n; i++ {
+			// Convert float64 [-1,1] to int16 little-endian, stereo.
+			l := int16(buf[i][0] * 32767)
+			r := int16(buf[i][1] * 32767)
+			pcmBuf.WriteByte(byte(l))
+			pcmBuf.WriteByte(byte(l >> 8))
+			pcmBuf.WriteByte(byte(r))
+			pcmBuf.WriteByte(byte(r >> 8))
+		}
+		if !ok {
+			break
+		}
+	}
+
+	args := []string{
+		"-loglevel", "quiet",
+		"-f", "s16le", "-ar", strconv.Itoa(rate), "-ac", "2",
+		"-i", "pipe:0",
+		"-af", filterStr,
+		"-f", "s16le", "-ar", strconv.Itoa(rate), "-ac", "2",
+		"pipe:1",
+	}
+
+	cmd := exec.Command("ffmpeg", args...)
+	cmd.Stdin = &pcmBuf
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("ffmpeg: %w", err)
+	}
+
+	// Wrap the raw PCM output back into a beep.Streamer.
+	return &pcmStreamer{data: out, pos: 0}, nil
+}
+
+// pcmStreamer wraps raw s16le stereo PCM bytes as a beep.Streamer.
+type pcmStreamer struct {
+	data []byte
+	pos  int
+}
+
+func (p *pcmStreamer) Stream(samples [][2]float64) (int, bool) {
+	n := 0
+	for n < len(samples) {
+		if p.pos+3 >= len(p.data) {
+			break
+		}
+		l := int16(p.data[p.pos]) | int16(p.data[p.pos+1])<<8
+		r := int16(p.data[p.pos+2]) | int16(p.data[p.pos+3])<<8
+		samples[n][0] = float64(l) / 32768.0
+		samples[n][1] = float64(r) / 32768.0
+		p.pos += 4
+		n++
+	}
+	return n, p.pos < len(p.data)
+}
+
+func (p *pcmStreamer) Err() error { return nil }
+
 // amplitudeToVolume maps a detected amplitude to a beep/effects.Volume
 // level. Amplitude typically ranges from ~0.05 (light tap) to ~1.0+
 // (hard slap). The mapping uses a logarithmic curve so that light taps
@@ -541,12 +680,17 @@ func playAudio(pack *soundPack, path string, amplitude float64, speakerInit *boo
 		}
 	}
 
-	// Apply speed change via resampling trick:
-	// Claiming the audio is at rate*speed and resampling back to rate
-	// makes the speaker consume samples faster/slower.
-	if speedRatio != 1.0 && speedRatio > 0 {
-		fakeRate := beep.SampleRate(int(float64(format.SampleRate) * speedRatio))
-		source = beep.Resample(4, fakeRate, format.SampleRate, source)
+	// Apply speed and pitch independently via ffmpeg if either is non-default.
+	// ffmpeg is used as a subprocess: audio is piped in, processed, piped out.
+	// This allows true pitch-shifting (asetrate) independent from speed (atempo).
+	if (speedRatio != 1.0 || pitchRatio != 1.0) && speedRatio > 0 && pitchRatio > 0 {
+		processed, err := processAudioFFmpeg(source, format.SampleRate, speedRatio, pitchRatio)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "spank: ffmpeg processing failed: %v\n", err)
+			// fall through and play unmodified
+		} else {
+			source = processed
+		}
 	}
 
 	done := make(chan bool)
@@ -562,6 +706,7 @@ type stdinCommand struct {
 	Amplitude float64 `json:"amplitude,omitempty"`
 	Cooldown  int     `json:"cooldown,omitempty"`
 	Speed     float64 `json:"speed,omitempty"`
+	Pitch     float64 `json:"pitch,omitempty"`
 }
 
 // readStdinCommands reads JSON commands from stdin for live control
@@ -612,8 +757,11 @@ func processCommands(r io.Reader, w io.Writer) {
 			if cmd.Speed > 0 {
 				speedRatio = cmd.Speed
 			}
+			if cmd.Pitch > 0 {
+				pitchRatio = cmd.Pitch
+			}
 			if stdioMode {
-				fmt.Fprintf(w, `{"status":"settings_updated","amplitude":%.4f,"cooldown":%d,"speed":%.2f}%s`, minAmplitude, cooldownMs, speedRatio, "\n")
+				fmt.Fprintf(w, `{"status":"settings_updated","amplitude":%.4f,"cooldown":%d,"speed":%.2f,"pitch":%.2f}%s`, minAmplitude, cooldownMs, speedRatio, pitchRatio, "\n")
 			}
 		case "volume-scaling":
 			volumeScaling = !volumeScaling
@@ -625,7 +773,7 @@ func processCommands(r io.Reader, w io.Writer) {
 			isPaused := paused
 			pausedMu.RUnlock()
 			if stdioMode {
-				fmt.Fprintf(w, `{"status":"ok","paused":%t,"amplitude":%.4f,"cooldown":%d,"volume_scaling":%t,"speed":%.2f}%s`, isPaused, minAmplitude, cooldownMs, volumeScaling, speedRatio, "\n")
+				fmt.Fprintf(w, `{"status":"ok","paused":%t,"amplitude":%.4f,"cooldown":%d,"volume_scaling":%t,"speed":%.2f,"pitch":%.2f}%s`, isPaused, minAmplitude, cooldownMs, volumeScaling, speedRatio, pitchRatio, "\n")
 			}
 		default:
 			if stdioMode {

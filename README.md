@@ -59,9 +59,17 @@ sudo spank --sexy --min-amplitude 0.2
 sudo spank --cooldown 600
 
 # Set playback speed multiplier (default: 1.0)
-sudo spank --speed 0.7   # slower and deeper
+sudo spank --speed 0.7   # slower
 sudo spank --speed 1.5   # faster
-sudo spank --sexy --speed 0.6
+sudo spank --sexy --speed 0.8
+
+# Set pitch multiplier (default: 1.0) — requires ffmpeg
+sudo spank --pitch 0.7   # deeper
+sudo spank --pitch 1.3   # higher
+sudo spank --sexy --pitch 0.7 --speed 0.9  # deeper and slightly slower
+
+# Set starting intensity level for sexy mode (default: 0, max: 59)
+sudo spank --sexy --start-level 20
 ```
 
 ### Modes
@@ -89,6 +97,20 @@ Control detection sensitivity with `--min-amplitude` (default: `0.05`):
 - Higher values (e.g., 0.30-0.50): Only strong impacts trigger sounds
 
 The value represents the minimum acceleration amplitude (in g-force) required to trigger a sound.
+
+### Audio tuning
+
+**Speed** (`--speed`): Adjusts playback speed without affecting pitch. Uses `beep.Resample` internally. Default: `1.0`.
+
+**Pitch** (`--pitch`): Adjusts pitch independently from speed. Requires `ffmpeg` in PATH (`brew install ffmpeg`). Uses `asetrate` for pitch shifting and `atempo` for speed compensation so the two are fully decoupled. Default: `1.0`.
+
+- Values below `1.0` make the audio deeper/slower
+- Values above `1.0` make it higher/faster
+- Both flags can be combined: `--pitch 0.7 --speed 1.2`
+
+If `ffmpeg` is not found, `--pitch` is silently ignored and audio plays unmodified.
+
+**Start level** (`--start-level`): Sets the minimum intensity index for sexy mode (0–59). Instead of always starting from the least intense clip, spank begins at the given level and escalates from there. Default: `0`.
 
 ## Running as a Service
 
@@ -211,8 +233,10 @@ sudo launchctl unload /Library/LaunchDaemons/com.taigrr.spank.plist
 2. Runs vibration detection (STA/LTA, CUSUM, kurtosis, peak/MAD)
 3. When a significant impact is detected, plays an embedded MP3 response
 4. **Optional volume scaling** (`--volume-scaling`) — light taps play quietly, hard slaps play at full volume
-5. **Optional speed control** (`--speed`) — adjusts playback speed and pitch (0.5 = half speed, 2.0 = double speed)
-6. 750ms cooldown between responses to prevent rapid-fire, adjustable with `--cooldown`
+5. **Optional speed control** (`--speed`) — adjusts playback speed via resampling
+6. **Optional pitch control** (`--pitch`) — shifts pitch independently from speed via ffmpeg (`asetrate` + `atempo`)
+7. **Optional start level** (`--start-level`) — sets a minimum intensity floor for sexy mode
+8. 750ms cooldown between responses to prevent rapid-fire, adjustable with `--cooldown`
 
 ## Star History
 
